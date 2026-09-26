@@ -11,6 +11,7 @@ ipv4_gateway=$3
 ipv6_addr=$4
 ipv6_gateway=$5
 is_in_china=$6
+ipv6_extra_addrs=$7
 
 DHCP_TIMEOUT=15
 DNS_FILE_TIMEOUT=5
@@ -171,6 +172,20 @@ add_missing_ipv6_config() {
                 ip -6 route add default via "$ipv6_gateway" dev "$ethx" onlink
             fi
         fi
+
+        # 添加额外的 IPv6 地址（逗号分隔）
+        # 在腾讯云上，dhcpv6 获取的 IPv6 不是旧系统的 IPv6，且不可用
+        # 脚本添加旧系统的 IPv6 地址和额外的 IPv6 地址后，额外的 IPv6 地址在 ip -6 addr 第一位
+        # get_first_ipv6_addr 获得的是额外的 IPv6 地址，也就是不可用的 IPv6 地址
+        # 导致 ipv6 test_internet 失败
+        # 因此暂时关闭 ipv6_extra_addrs
+        if false && [ -n "$ipv6_extra_addrs" ]; then
+            printf '%s\n' "$ipv6_extra_addrs" | tr ',' '\n' | while IFS= read -r addr; do
+                if [ -n "$addr" ]; then
+                    ip -6 addr add "$addr" dev "$ethx" 2>/dev/null || true
+                fi
+            done
+        fi
     fi
 }
 
@@ -240,11 +255,17 @@ test_connect() {
 test_internet() {
     for i in $(seq 5); do
         echo "Testing Internet Connection. Test $i... "
-        if is_need_test_ipv4 && { local current_ipv4_addr; current_ipv4_addr="$(get_first_ipv4_addr | remove_netmask)"; test_connect "$current_ipv4_addr" "$ipv4_dns1" >/dev/null 2>&1 || test_connect "$current_ipv4_addr" "$ipv4_dns2" >/dev/null 2>&1; }; then
+        if is_need_test_ipv4 &&
+            current_ipv4_addr="$(get_first_ipv4_addr | remove_netmask)" &&
+            { test_connect "$current_ipv4_addr" "$ipv4_dns1" ||
+                test_connect "$current_ipv4_addr" "$ipv4_dns2"; } >/dev/null 2>&1; then
             echo "IPv4 has internet."
             ipv4_has_internet=true
         fi
-        if is_need_test_ipv6 && { local current_ipv6_addr; current_ipv6_addr="$(get_first_ipv6_addr | remove_netmask)"; test_connect "$current_ipv6_addr" "$ipv6_dns1" >/dev/null 2>&1 || test_connect "$current_ipv6_addr" "$ipv6_dns2" >/dev/null 2>&1; }; then
+        if is_need_test_ipv6 &&
+            current_ipv6_addr="$(get_first_ipv6_addr | remove_netmask)" &&
+            { test_connect "$current_ipv6_addr" "$ipv6_dns1" ||
+                test_connect "$current_ipv6_addr" "$ipv6_dns2"; } >/dev/null 2>&1; then
             echo "IPv6 has internet."
             ipv6_has_internet=true
         fi
@@ -339,13 +360,14 @@ EOF
     db_progress INFO netcfg/link_detect_progress
 else
     # alpine
-    # h3c 移动云电脑使用 udhcpc 会重复提示 sending select，无法获得 ipv6，因此使用 dhcpcd
-    method=dhcpcd
+    # h3c 移动云电脑使用 udhcpc 会重复提示 sending select，因此添加 timeout 强制结束进程
+    # dhcpcd 会配置租约时间，过期会移除 IP，但我们的没有在后台运行 dhcpcd ，因此用 udhcpc
+    method=udhcpc
 
     case "$method" in
     udhcpc)
-        udhcpc -i "$ethx" -f -q -n || true
-        udhcpc6 -i "$ethx" -f -q -n || true
+        timeout $DHCP_TIMEOUT udhcpc -i "$ethx" -f -q -n || true
+        timeout $DHCP_TIMEOUT udhcpc6 -i "$ethx" -f -q -n || true
         sleep $DNS_FILE_TIMEOUT # 好像不用等待写入 dns，但是以防万一
         ;;
     dhcpcd)
@@ -499,5 +521,6 @@ echo "$ipv4_addr" >"$netconf/ipv4_addr"
 echo "$ipv4_gateway" >"$netconf/ipv4_gateway"
 echo "$ipv6_addr" >"$netconf/ipv6_addr"
 echo "$ipv6_gateway" >"$netconf/ipv6_gateway"
+echo "$ipv6_extra_addrs" >"$netconf/ipv6_extra_addrs"
 $ipv4_has_internet && echo 1 >"$netconf/ipv4_has_internet" || echo 0 >"$netconf/ipv4_has_internet"
 $ipv6_has_internet && echo 1 >"$netconf/ipv6_has_internet" || echo 0 >"$netconf/ipv6_has_internet"

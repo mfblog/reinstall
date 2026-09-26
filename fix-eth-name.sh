@@ -5,63 +5,99 @@
 
 set -eE
 
-# openeuler 需等待 udev 将网卡名从 eth0 改为 enp3s0
-sleep 10
-# 不知道有没有用
-if command -v udevadm >/dev/null; then
-    # udevadm trigger
-    udevadm settle
-elif command -v mdev >/dev/null; then
-    mdev -sf
-fi
-
 # 本脚本在首次进入新系统后运行
 # 将 trans 阶段生成的网络配置中的网卡名(eth0) 改为正确的网卡名，也适用于以下情况
 # 1. alpine 要运行此脚本，因为安装后的内核可能有 netboot 没有的驱动
 # 2. dmit debian 普通内核(安装时)和云内核网卡名不一致
 #    https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=928923
 
-# todo: 删除 cloud-init
+# openeuler 需等待 udev 将网卡名从 eth0 改为 enp3s0
+# openeuler 本脚本运行一秒后才有 enp3s0
+# 用 systemd-analyze plot >a.svg 发现 sys-subsystem-net-devices-enp3s0.device 也是出现在 NetworkManager 之后
+
+# 有些时候网卡名还会来回修改几次
+# 因此需要等待网卡名稳定
+
+# 不知道有没有用
+if false; then
+    if command -v udevadm >/dev/null; then
+        # udevadm trigger
+        udevadm settle || true
+    elif command -v mdev >/dev/null; then
+        mdev -sf || true
+    fi
+    sleep 1
+fi
+
+has_eth=false  # 是否检查到网卡
+check_count=0  # 总检查次数
+stable_count=0 # 网卡名稳定的次数
+old_state=
+while true; do
+    check_count=$((check_count + 1))
+
+    new_state=$(ip -o link | awk '$2 != "lo:"')
+    if [ -n "$new_state" ]; then
+        has_eth=true
+    fi
+
+    if $has_eth && [ "$old_state" = "$new_state" ]; then
+        stable_count=$((stable_count + 1))
+    else
+        stable_count=0
+    fi
+
+    old_state=$new_state
+
+    echo "Waiting for the NICs to be stable (${stable_count}s/10s)..."
+
+    # 稳定 10 秒后退出循环
+    if $has_eth && [ "$stable_count" -ge 10 ]; then
+        break
+    fi
+
+    # 60 秒都没发现网卡则退出脚本
+    if ! $has_eth && [ "$check_count" -ge 60 ]; then
+        exit 1
+    fi
+
+    sleep 1
+done
 
 to_lower() {
     tr '[:upper:]' '[:lower:]'
 }
 
-retry() {
-    local max_try=$1
-    shift
-
-    for i in $(seq "$max_try"); do
-        if "$@"; then
-            return
-        else
-            ret=$?
-            if [ "$i" -ge "$max_try" ]; then
-                return $ret
-            fi
-            sleep 1
-        fi
-    done
-}
-
-# openeuler 本脚本运行一秒后才有 enp3s0
-# 用 systemd-analyze plot >a.svg 发现 sys-subsystem-net-devices-enp3s0.device 也是出现在 NetworkManager 之后
-# 因此需要等待网卡出现
 get_ethx_by_mac() {
     mac=$(echo "$1" | to_lower)
-    retry 10 _get_ethx_by_mac "$mac"
-}
 
-_get_ethx_by_mac() {
+    flag=$2
+    if [ -z "$flag" ]; then
+        flag=master
+    fi
+
     if true; then
-        # 过滤 azure vf (带 master ethx)
-        ip -o link | grep -i "$mac" | grep -v master | awk '{print $2}' | cut -d: -f1 | grep .
-        return
+        if [ "$flag" = master ]; then
+            # master
+            # 过滤 azure vf (带 master ethx)
+            ip -o link | grep -i "$mac" | grep -v master | awk '{print $2}' | cut -d: -f1 | grep .
+        else
+            # slave
+            # 带 master ethx
+            ip -o link | grep -i "$mac" | grep -w master | awk '{print $2}' | cut -d: -f1 | grep .
+        fi
     else
         for i in $(cd /sys/class/net && echo *); do
             if [ "$(cat "/sys/class/net/$i/address")" = "$mac" ]; then
-                echo "$i"
-                return
+                if [ $(($(cat "/sys/class/net/$i/flags") & 0x800)) -ne 0 ]; then
+                    fact_flag=slave
+                else
+                    fact_flag=master
+                fi
+                if [ "$flag" = "$fact_flag" ]; then
+                    echo "$i"
+                    return
+                fi
             fi
         done
         return 1
@@ -138,6 +174,23 @@ fix_network_manager() {
 
         # 更改文件名
         mv "$file" "$proper_file"
+
+        # NM 不会自动忽略 Azure 的 slave 网卡，需手动设置
+        # azure 文档中的方法不够通用，只适合 azure
+        # https://learn.microsoft.com/zh-cn/azure/virtual-network/accelerated-networking-overview
+
+        # 我们采用红帽的方法
+        # https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/8/html/configuring_and_managing_networking/configuring-networkmanager-to-ignore-certain-devices_configuring-and-managing-networking
+        if slave_ethx=$(get_ethx_by_mac "$mac" slave); then
+            cat >"/etc/NetworkManager/conf.d/99-$slave_ethx-unmanaged.conf" <<EOF
+[device-$slave_ethx-unmanaged]
+match-device=interface-name:$slave_ethx
+managed=0
+EOF
+        fi
+
+        # 也可以设置 unmanaged-devices, 但是官方文档不推荐
+        # https://networkmanager.pages.freedesktop.org/NetworkManager/NetworkManager/NetworkManager.conf.html#:~:text=may%20be%20a-,better%20choice,-.
     done
 }
 
